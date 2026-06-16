@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -20,6 +21,8 @@ from groq import Groq
 from utils.data_loader import load_listings
 
 load_dotenv()
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -32,6 +35,39 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+def _call_groq(prompt: str, temperature: float = 0.7) -> str:
+    """Send a prompt to Groq and return the model response text."""
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _listing_search_text(listing: dict) -> str:
+    """Build one lowercase string from a listing's searchable fields."""
+    tags = " ".join(listing.get("style_tags", []))
+    return f"{listing.get('title', '')} {listing.get('description', '')} {tags}".lower()
+
+
+def _description_keywords(description: str) -> list[str]:
+    """Split a description into lowercase keywords for scoring."""
+    return [word for word in re.findall(r"[a-z0-9]+", description.lower()) if word]
+
+
+def _score_listing(listing: dict, keywords: list[str]) -> int:
+    """Count how many description keywords appear in a listing."""
+    searchable = _listing_search_text(listing)
+    return sum(1 for keyword in keywords if keyword in searchable)
+
+
+def _size_matches(listing_size: str, requested_size: str) -> bool:
+    """Case insensitive size check. 'M' matches 'S/M' or 'M'."""
+    return requested_size.lower() in listing_size.lower()
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -66,11 +102,26 @@ def search_listings(
         3. Score each remaining listing by keyword overlap with `description`.
         4. Drop any listings with a score of 0 (no relevant matches).
         5. Sort by score, highest first, and return the listing dicts.
-
-    Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+    keywords = _description_keywords(description)
+
+    if not keywords:
+        return []
+
+    scored: list[tuple[int, dict]] = []
+    for listing in listings:
+        if max_price is not None and listing["price"] > max_price:
+            continue
+        if size is not None and not _size_matches(listing["size"], size):
+            continue
+
+        score = _score_listing(listing, keywords)
+        if score > 0:
+            scored.append((score, listing))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [listing for _, listing in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -97,11 +148,60 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
            the LLM to suggest specific outfit combinations using the new item
            and named pieces from the wardrobe.
         4. Return the LLM's response as a string.
-
-    Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    items = wardrobe.get("items", [])
+    item_details = (
+        f"Title: {new_item.get('title')}\n"
+        f"Category: {new_item.get('category')}\n"
+        f"Style tags: {', '.join(new_item.get('style_tags', []))}\n"
+        f"Colors: {', '.join(new_item.get('colors', []))}\n"
+        f"Size: {new_item.get('size')}\n"
+        f"Condition: {new_item.get('condition')}\n"
+        f"Price: ${new_item.get('price', 0):.2f}\n"
+        f"Platform: {new_item.get('platform')}\n"
+        f"Description: {new_item.get('description')}"
+    )
+
+    voice = """You are FitFindr, a fashion bestie with main character energy. You talk like a viral TikTok stylist:
+- Short, punchy sentences. Easy to scan in 5 seconds.
+- Name the vibe clearly (grunge girl fall, clean girl minimal, y2k chaos, etc.).
+- One tiny styling hack that actually changes the look.
+- Light humor is welcome — playful, not try-hard. Think "this ate" not corporate brochure.
+- No bullet lists. No hashtags. Sound like a real person texting a friend."""
+
+    if not items:
+        prompt = f"""{voice}
+
+A user just found this thrift piece but their wardrobe is empty — they need inspo from scratch.
+
+THE FIND:
+{item_details}
+
+Write 1 to 2 outfit ideas (3 to 5 sentences total). Paint the full look: bottoms, shoes, and one optional layer. Give each look a fun vibe name. Explain why the combo works in plain language. End with one line that hypes them up to buy it (or gently roast them if they skip it). Keep it aesthetic, scrollable, and actually useful."""
+    else:
+        wardrobe_lines = []
+        for item in items:
+            notes = item.get("notes") or ""
+            note_text = f" — {notes}" if notes else ""
+            tags = ", ".join(item.get("style_tags", []))
+            wardrobe_lines.append(
+                f"- {item['name']} ({item['category']}, {', '.join(item['colors'])}, tags: {tags}){note_text}"
+            )
+        wardrobe_text = "\n".join(wardrobe_lines)
+
+        prompt = f"""{voice}
+
+A user is about to pull the trigger on this thrift find. Style it using what they ALREADY own.
+
+THE FIND:
+{item_details}
+
+THEIR CLOSET:
+{wardrobe_text}
+
+Write 1 to 2 complete outfits (3 to 6 sentences total). Name specific pieces from their closet — do not invent items they do not have. Give each look a vibe label (2 to 4 words). Drop one micro styling tip (tuck, roll, layer, cuff, etc.) that makes it look intentional not random. Make it feel like a Pinterest board came to life. A little funny is good — like you are hyping your friend before they walk out the door."""
+
+    return _call_groq(prompt, temperature=0.8)
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -130,8 +230,42 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
         2. Build a prompt that gives the LLM the item details and the outfit,
            and asks for a caption matching the style guidelines above.
         3. Call the LLM and return the response.
-
-    Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    if not outfit or not outfit.strip():
+        return "Cannot create fit card without an outfit suggestion."
+
+    title = new_item.get("title", "thrift find")
+    price = new_item.get("price")
+    platform = new_item.get("platform", "a thrift app")
+    condition = new_item.get("condition", "")
+    style_tags = ", ".join(new_item.get("style_tags", []))
+
+    prompt = f"""Write a viral fit check caption for Instagram or TikTok. This is an OOTD post, not a product review.
+
+THE THRIFT SCORE:
+- Item: {title}
+- Price: ${price:.2f}
+- Platform: {platform}
+- Condition: {condition}
+- Vibe tags: {style_tags}
+
+HOW THEY STYLED IT:
+{outfit}
+
+VOICE AND VIBE:
+- Sound like someone who just scored a steal and cannot shut up about it
+- Aesthetic, easy to read, scroll-stopping — short sentences, natural flow
+- A little funny or unhinged in a relatable way (soft brag, gentle chaos, "why is this $19")
+- Mention the item name, price, and platform once each — woven in, not listed like a receipt
+- Capture the outfit energy in 2 to 4 sentences max
+- Optional: one emoji max, only if it genuinely fits
+- No hashtags, no "link in bio", no "outfit details below"
+- Never sound like an ad, a bot, or a fashion magazine
+
+Examples of the energy (do not copy):
+- "thrifted this off depop for $19 and honestly it was made for my wide legs, full fit on my story"
+- "no because why was this sitting on poshmark for $22… the grunge gods smiled on me today"
+
+Write ONE caption. Make it feel fresh every time."""
+
+    return _call_groq(prompt, temperature=0.95)
